@@ -1,5 +1,7 @@
 //! 定义可扩展的 Agent 会话来源接口和运行时注册表。
 
+pub mod codex;
+
 use std::path::Path;
 
 use thiserror::Error;
