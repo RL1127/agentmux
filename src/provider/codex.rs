@@ -403,32 +403,55 @@ impl SessionProvider for CodexProvider {
         });
 
         let config_path = self.config_path();
-        diagnostics.push(if config_path.is_file() {
-            Diagnostic {
-                name: "codex-config".to_owned(),
-                severity: DiagnosticSeverity::Info,
-                message: format!("配置文件存在: {}", config_path.display()),
-                suggestion: None,
-            }
-        } else {
+        diagnostics.push(if !config_path.is_file() {
             Diagnostic {
                 name: "codex-config".to_owned(),
                 severity: DiagnosticSeverity::Warning,
                 message: format!("配置文件不存在: {}", config_path.display()),
                 suggestion: Some("先运行 codex 完成初始配置".to_owned()),
             }
+        } else {
+            match config::inspect_config(&config_path) {
+                Ok(summary) => Diagnostic {
+                    name: "codex-config".to_owned(),
+                    severity: DiagnosticSeverity::Info,
+                    message: format!(
+                        "配置 TOML 有效，默认 provider: {}，已定义 {} 个 provider",
+                        summary.default_provider.as_deref().unwrap_or("未设置"),
+                        summary.provider_count
+                    ),
+                    suggestion: None,
+                },
+                Err(_) => Diagnostic {
+                    name: "codex-config".to_owned(),
+                    severity: DiagnosticSeverity::Error,
+                    message: format!("配置文件无法解析: {}", config_path.display()),
+                    suggestion: Some(
+                        "修正 config.toml 后运行 codex --strict-config features list".to_owned(),
+                    ),
+                },
+            }
         });
 
-        let existing_roots = self
+        let session_count = self
             .session_roots()
             .into_iter()
             .filter(|path| path.is_dir())
+            .flat_map(|path| WalkDir::new(path).follow_links(false))
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+            })
             .count();
-        diagnostics.push(if existing_roots > 0 {
+        diagnostics.push(if session_count > 0 {
             Diagnostic {
                 name: "codex-sessions".to_owned(),
                 severity: DiagnosticSeverity::Info,
-                message: format!("已找到 Codex 会话目录: {}", self.home.display()),
+                message: format!(
+                    "已找到 {session_count} 个 Codex 会话文件: {}",
+                    self.home.display()
+                ),
                 suggestion: None,
             }
         } else {

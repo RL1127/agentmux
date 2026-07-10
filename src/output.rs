@@ -6,7 +6,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::catalog::{GroupBy, SessionGroup};
-use crate::domain::{ScanWarning, Session};
+use crate::domain::{
+    Diagnostic, DiagnosticSeverity, ProviderCapability, ScanWarning, Session, SourceDescriptor,
+};
 
 /// 输出 list 查询结果；JSON 包含分组和警告，文本仅展示已脱敏元数据。
 pub fn write_list(
@@ -81,6 +83,80 @@ fn truncate_chars(value: &str, limit: usize) -> String {
         result.push('…');
     }
     result
+}
+
+/// 输出 doctor 诊断项；JSON 保持结构化，文本使用稳定状态标签。
+pub fn write_diagnostics(
+    mut writer: impl Write,
+    diagnostics: &[Diagnostic],
+    json: bool,
+) -> Result<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut writer, diagnostics)?;
+        writeln!(writer)?;
+        return Ok(());
+    }
+    for diagnostic in diagnostics {
+        writeln!(
+            writer,
+            "[{}] {}: {}",
+            severity_label(diagnostic.severity),
+            diagnostic.name,
+            diagnostic.message
+        )?;
+        if let Some(suggestion) = diagnostic.suggestion.as_deref() {
+            writeln!(writer, "      建议: {suggestion}")?;
+        }
+    }
+    Ok(())
+}
+
+/// 输出已注册来源及其能力，不依赖任何来源特有实现。
+pub fn write_sources(
+    mut writer: impl Write,
+    sources: &[SourceDescriptor],
+    json: bool,
+) -> Result<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut writer, sources)?;
+        writeln!(writer)?;
+        return Ok(());
+    }
+    for source in sources {
+        let capabilities = source
+            .capabilities
+            .iter()
+            .map(capability_label)
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            writer,
+            "{}  {}  [{}]",
+            source.id, source.display_name, capabilities
+        )?;
+        writeln!(writer, "  {}", source.description)?;
+    }
+    Ok(())
+}
+
+/// 返回 doctor 文本输出使用的严重程度标签。
+fn severity_label(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Info => "OK",
+        DiagnosticSeverity::Warning => "WARN",
+        DiagnosticSeverity::Error => "ERROR",
+    }
+}
+
+/// 返回来源能力的稳定命令行标签。
+fn capability_label(capability: &ProviderCapability) -> &'static str {
+    match capability {
+        ProviderCapability::Scan => "scan",
+        ProviderCapability::Summary => "summary",
+        ProviderCapability::Resume => "resume",
+        ProviderCapability::Diagnose => "diagnose",
+        ProviderCapability::RepairProvider => "repair-provider",
+    }
 }
 
 /// JSON list 命令的顶层稳定结构。

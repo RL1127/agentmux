@@ -13,6 +13,47 @@ use crate::domain::RepairReport;
 use crate::provider::ProviderError;
 use crate::resume::command_for;
 
+/// 汇总 doctor 可安全展示的 Codex 配置元数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ConfigSummary {
+    /// 当前默认 provider 名称。
+    pub default_provider: Option<String>,
+    /// model_providers 表中定义的别名数量。
+    pub provider_count: usize,
+}
+
+/// 解析配置并返回默认 provider 与别名数量，不读取或返回配置值。
+pub(super) fn inspect_config(config_path: &Path) -> Result<ConfigSummary, ProviderError> {
+    let bytes = fs::read(config_path).map_err(|source| ProviderError::Io {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    let document = parse_document(config_path, &bytes)?;
+    let default_provider = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(ToOwned::to_owned);
+    let provider_count = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .map(|providers| providers.len())
+        .unwrap_or(0);
+    if let Some(default) = default_provider.as_deref()
+        && !document
+            .get("model_providers")
+            .and_then(Item::as_table_like)
+            .is_some_and(|providers| providers.contains_key(default))
+    {
+        return Err(ProviderError::Config {
+            message: format!("默认 provider {default} 没有对应配置表"),
+        });
+    }
+    Ok(ConfigSummary {
+        default_provider,
+        provider_count,
+    })
+}
+
 /// 检查配置中是否存在指定 model_providers 表。
 pub(super) fn provider_exists(config_path: &Path, provider: &str) -> Result<bool, ProviderError> {
     if !config_path.is_file() {

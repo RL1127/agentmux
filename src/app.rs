@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 
 use crate::catalog::{SessionCatalog, SessionQuery, group_sessions};
 use crate::cli::{AgentmuxCommand, Cli, ListArgs, ResumeArgs, parse_since};
-use crate::domain::{CommandSpec, RepairOptions, Session};
-use crate::output::write_list;
+use crate::domain::{CommandSpec, DiagnosticSeverity, RepairOptions, Session};
+use crate::output::{write_diagnostics, write_list, write_sources};
 use crate::provider::ProviderRegistry;
 use crate::provider::codex::CodexProvider;
 use crate::resume;
@@ -58,14 +59,11 @@ pub fn run_cli(cli: Cli, mut stdout: impl Write, mut stderr: impl Write) -> Resu
             Ok(0)
         }
         Some(AgentmuxCommand::Resume(args)) => run_resume(args, &mut stdout, &mut stderr),
-        Some(AgentmuxCommand::Doctor(_)) => {
-            bail!("doctor 命令尚未接入诊断输出")
-        }
-        Some(AgentmuxCommand::Sources(_)) => {
-            bail!("sources 命令尚未接入来源输出")
-        }
-        Some(AgentmuxCommand::Completion { .. }) => {
-            bail!("completion 命令尚未接入补全生成器")
+        Some(AgentmuxCommand::Doctor(args)) => run_doctor(args.json, &mut stdout),
+        Some(AgentmuxCommand::Sources(args)) => run_sources(args.json, &mut stdout),
+        Some(AgentmuxCommand::Completion { shell }) => {
+            run_completion(shell, &mut stdout);
+            Ok(0)
         }
         None => bail!("当前构建尚未接入交互式界面，请先使用 agentmux list"),
     }
@@ -205,4 +203,35 @@ fn prepare_resume_command(registry: &ProviderRegistry, session: &Session) -> Res
         );
     }
     Ok(provider.build_resume_command(session)?)
+}
+
+/// 汇总全部来源诊断并在存在 error 项时返回非零状态。
+fn run_doctor(json: bool, stdout: &mut impl Write) -> Result<i32> {
+    let registry = default_registry()?;
+    let diagnostics = registry
+        .providers()
+        .flat_map(|provider| provider.diagnose())
+        .collect::<Vec<_>>();
+    let has_error = diagnostics
+        .iter()
+        .any(|item| item.severity == DiagnosticSeverity::Error);
+    write_diagnostics(stdout, &diagnostics, json)?;
+    Ok(i32::from(has_error))
+}
+
+/// 从注册表输出所有来源描述和能力。
+fn run_sources(json: bool, stdout: &mut impl Write) -> Result<i32> {
+    let registry = default_registry()?;
+    let sources = registry
+        .providers()
+        .map(|provider| provider.descriptor())
+        .collect::<Vec<_>>();
+    write_sources(stdout, &sources, json)?;
+    Ok(0)
+}
+
+/// 使用 clap 命令模型生成目标 shell 补全脚本。
+fn run_completion(shell: Shell, stdout: &mut impl Write) {
+    let mut command = Cli::command();
+    clap_complete::generate(shell, &mut command, "agentmux", stdout);
 }
