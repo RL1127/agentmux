@@ -77,10 +77,10 @@ pub struct ResumeArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// 显式创建历史模型提供商兼容别名。
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dry_run")]
     pub repair_provider: bool,
     /// 跳过 provider 修复确认提示。
-    #[arg(long)]
+    #[arg(long, requires = "repair_provider")]
     pub yes: bool,
 }
 

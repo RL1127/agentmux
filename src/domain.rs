@@ -340,9 +340,11 @@ pub struct RepairReport {
     /// 被修改的配置文件。
     pub config_path: PathBuf,
     /// 修改前生成的备份文件。
-    pub backup_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
     /// 新增的历史 provider 兼容别名。
     pub alias: String,
+    /// 是否实际写入了新别名。
+    pub changed: bool,
     /// 修复完成后的说明。
     pub message: String,
 }

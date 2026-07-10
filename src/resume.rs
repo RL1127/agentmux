@@ -86,11 +86,10 @@ fn terminal_is_interactive() -> bool {
 
 /// 使用继承的三个标准流启动子进程，并返回其精确退出码。
 fn run_inherited(spec: &CommandSpec) -> Result<i32, ResumeError> {
-    let program =
-        resolve_program(&spec.program).ok_or_else(|| ResumeError::CommandUnavailable {
+    let mut command =
+        command_for(&spec.program, &spec.args).ok_or_else(|| ResumeError::CommandUnavailable {
             program: spec.program.display().to_string(),
         })?;
-    let mut command = platform_command(&program, &spec.args);
     let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -101,6 +100,12 @@ fn run_inherited(spec: &CommandSpec) -> Result<i32, ResumeError> {
             source,
         })?;
     status.code().ok_or(ResumeError::MissingExitCode)
+}
+
+/// 为 crate 内部调用方解析程序并创建保留参数边界的平台命令。
+pub(crate) fn command_for(program: &Path, args: &[OsString]) -> Option<Command> {
+    let resolved = resolve_program(program)?;
+    Some(platform_command(&resolved, args))
 }
 
 /// 创建平台进程；Windows 批处理包装器由 cmd.exe 解释，其他程序直接执行。

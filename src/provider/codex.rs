@@ -1,5 +1,7 @@
 //! Codex 本地会话的只读扫描、摘要读取、恢复检查和环境诊断实现。
 
+mod config;
+
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -15,9 +17,9 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::domain::{
-    CommandSpec, Diagnostic, DiagnosticSeverity, InteractionType, ProviderCapability, ResumeState,
-    ResumeStatus, ScanReport, ScanWarning, Session, SessionSummary, SourceDescriptor, SourceId,
-    WarningKind,
+    CommandSpec, Diagnostic, DiagnosticSeverity, InteractionType, ProviderCapability,
+    RepairOptions, RepairReport, ResumeState, ResumeStatus, ScanReport, ScanWarning, Session,
+    SessionSummary, SourceDescriptor, SourceId, WarningKind,
 };
 
 use super::{ProviderError, SessionProvider};
@@ -288,6 +290,11 @@ impl SessionProvider for CodexProvider {
             }
         }
 
+        for session in &mut sessions {
+            session.resume = self.check_resume(session).unwrap_or_else(|_| {
+                ResumeStatus::blocked(ResumeState::Blocked, "Codex 恢复检查失败")
+            });
+        }
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         Ok(ScanReport { sessions, warnings })
     }
@@ -332,6 +339,25 @@ impl SessionProvider for CodexProvider {
                 ResumeState::CliMissing,
                 "未在 PATH 中找到 Codex CLI",
             ));
+        }
+        if let Some(provider) = session.model_provider.as_deref() {
+            match config::provider_exists(&self.config_path(), provider) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(ResumeStatus::blocked(
+                        ResumeState::ProviderMissing,
+                        format!(
+                            "历史 provider {provider} 未在 config.toml 中定义；使用 --repair-provider 显式修复"
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    return Ok(ResumeStatus::blocked(
+                        ResumeState::Blocked,
+                        "Codex config.toml 无法解析，请先运行 agentmux doctor",
+                    ));
+                }
+            }
         }
         Ok(ResumeStatus::ready())
     }
@@ -414,6 +440,27 @@ impl SessionProvider for CodexProvider {
             }
         });
         diagnostics
+    }
+
+    /// 将当前默认 provider 复制为会话历史名称，并执行备份、原子替换和校验。
+    fn repair_model_provider(
+        &self,
+        session: &Session,
+        options: RepairOptions,
+    ) -> Result<RepairReport, ProviderError> {
+        let historical_provider =
+            session
+                .model_provider
+                .as_deref()
+                .ok_or_else(|| ProviderError::Config {
+                    message: "会话历史未记录 model_provider，无法创建兼容别名".to_owned(),
+                })?;
+        config::repair_alias(
+            &self.config_path(),
+            &self.cli_program,
+            historical_provider,
+            options.confirmed,
+        )
     }
 }
 

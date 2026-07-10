@@ -1,6 +1,6 @@
 //! 负责命令分发，并将 CLI/TUI 与来源注册表连接起来。
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +9,7 @@ use clap::Parser;
 
 use crate::catalog::{SessionCatalog, SessionQuery, group_sessions};
 use crate::cli::{AgentmuxCommand, Cli, ListArgs, ResumeArgs, parse_since};
-use crate::domain::{CommandSpec, Session};
+use crate::domain::{CommandSpec, RepairOptions, Session};
 use crate::output::write_list;
 use crate::provider::ProviderRegistry;
 use crate::provider::codex::CodexProvider;
@@ -120,15 +120,26 @@ fn run_list(args: ListArgs, stdout: &mut impl Write, stderr: &mut impl Write) ->
 
 /// 执行显式 resume 子命令，并把 Codex 退出码原样返回给 main。
 fn run_resume(args: ResumeArgs, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
-    if args.repair_provider {
-        bail!("--repair-provider 将在 provider 配置修复模块中处理");
-    }
     let registry = default_registry()?;
     let catalog = SessionCatalog::from_report(registry.scan_all());
     let session = catalog
         .find(&args.session_id, None)
         .cloned()
         .with_context(|| format!("未找到会话 {}", args.session_id))?;
+    if args.repair_provider {
+        if args.dry_run {
+            bail!("--repair-provider 不能与 --dry-run 同时使用");
+        }
+        let confirmed = confirm_provider_repair(args.yes, &session, stdout)?;
+        let provider = registry
+            .get(&session.source)
+            .with_context(|| format!("来源 {} 未注册", session.source))?;
+        let report = provider.repair_model_provider(&session, RepairOptions { confirmed })?;
+        writeln!(stdout, "{}", report.message)?;
+        if let Some(backup_path) = report.backup_path {
+            writeln!(stdout, "配置备份: {}", backup_path.display())?;
+        }
+    }
     let execution = execute_session(&registry, &session, args.dry_run)?;
     if args.dry_run {
         writeln!(stdout, "将执行: {}", execution.command)?;
@@ -140,6 +151,33 @@ fn run_resume(args: ResumeArgs, stdout: &mut impl Write, stderr: &mut impl Write
         )?;
     }
     Ok(execution.exit_code)
+}
+
+/// 在未传入 yes 时从真实终端确认 provider 配置修改。
+fn confirm_provider_repair(
+    assume_yes: bool,
+    session: &Session,
+    stdout: &mut impl Write,
+) -> Result<bool> {
+    if assume_yes {
+        return Ok(true);
+    }
+    if !io::stdin().is_terminal() {
+        bail!("非交互环境执行 --repair-provider 时必须同时传入 --yes");
+    }
+    let provider = session.model_provider.as_deref().unwrap_or("unknown");
+    write!(
+        stdout,
+        "将备份 config.toml 并创建 provider 兼容别名 {provider}，继续吗？[y/N] "
+    )?;
+    stdout.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(true)
+    } else {
+        bail!("已取消 provider 配置修复")
+    }
 }
 
 /// 检查会话恢复状态、构造来源官方命令并交给终端执行器。

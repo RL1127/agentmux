@@ -61,6 +61,14 @@ pub enum ProviderError {
         /// 可选退出码；被信号终止时为空。
         exit_code: Option<i32>,
     },
+    /// 配置修复失败，若已生成备份则携带其路径。
+    #[error("配置修复失败: {message}")]
+    Repair {
+        /// 已脱敏的失败说明。
+        message: String,
+        /// 可用于人工恢复的原配置备份。
+        backup_path: Option<std::path::PathBuf>,
+    },
 }
 
 /// 每个 Agent 来源必须实现的扫描、摘要、恢复和诊断契约。
