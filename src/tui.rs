@@ -1,5 +1,6 @@
 //! 使用 ratatui 和 crossterm 提供跨平台会话选择界面。
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -13,6 +14,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -22,7 +25,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use ratatui::{Frame, symbols};
 use unicode_width::UnicodeWidthChar;
 
-use crate::catalog::{GroupBy, SessionCatalog, SessionQuery, group_sessions};
+use crate::catalog::{SessionCatalog, SessionQuery};
 use crate::domain::{InteractionType, ResumeState, ScanReport, Session};
 use crate::provider::ProviderRegistry;
 
@@ -122,12 +125,32 @@ fn run_loop(
     }
 }
 
-/// 保存界面查询、选择、扫描和错误状态。
+/// 表示当前处于目录选择层或目录内会话层。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserLevel {
+    /// 第一层只显示会话工作目录。
+    Directories,
+    /// 第二层显示选中目录中的会话和详情。
+    Sessions,
+}
+
+/// 保存同一工作目录下按更新时间倒序排列的会话。
+struct DirectoryGroup {
+    identity: String,
+    directory: String,
+    sessions: Vec<Session>,
+}
+
+/// 保存两级导航、查询、扫描和错误状态。
 struct AppState {
     catalog: Option<SessionCatalog>,
-    visible: Vec<VisibleSession>,
-    group_by: GroupBy,
-    selected: usize,
+    directories: Vec<DirectoryGroup>,
+    visible_directories: Vec<usize>,
+    visible_sessions: Vec<Session>,
+    level: BrowserLevel,
+    active_directory: Option<String>,
+    selected_directory: usize,
+    selected_session: usize,
     search: String,
     search_mode: bool,
     loading: bool,
@@ -136,13 +159,17 @@ struct AppState {
 }
 
 impl AppState {
-    /// 创建处于扫描状态的界面，可选展示上一次恢复失败信息。
+    /// 创建处于扫描状态的目录浏览器，可选展示上一次恢复失败信息。
     fn new(initial_error: Option<String>) -> Self {
         Self {
             catalog: None,
-            visible: Vec::new(),
-            group_by: GroupBy::Project,
-            selected: 0,
+            directories: Vec::new(),
+            visible_directories: Vec::new(),
+            visible_sessions: Vec::new(),
+            level: BrowserLevel::Directories,
+            active_directory: None,
+            selected_directory: 0,
+            selected_session: 0,
             search: String::new(),
             search_mode: false,
             loading: true,
@@ -151,48 +178,88 @@ impl AppState {
         }
     }
 
-    /// 接收后台扫描报告并重建可见会话列表。
+    /// 接收后台扫描报告，按完整工作目录建立第一层分组。
     fn load(&mut self, report: ScanReport) {
         self.loading = false;
         self.warning_count = report.warnings.len();
         self.catalog = Some(SessionCatalog::from_report(report));
+        self.rebuild_directories();
         self.rebuild_visible();
     }
 
-    /// 按当前搜索与分组条件生成表格行，默认排除非交互会话。
-    fn rebuild_visible(&mut self) {
+    /// 将交互式会话按规范化工作目录分组，组顺序由最新会话决定。
+    fn rebuild_directories(&mut self) {
+        self.directories.clear();
         let Some(catalog) = self.catalog.as_ref() else {
-            self.visible.clear();
-            self.selected = 0;
             return;
         };
-        let query = SessionQuery {
-            search: (!self.search.is_empty()).then(|| self.search.clone()),
-            include_non_interactive: false,
-            ..SessionQuery::default()
-        };
-        let groups = group_sessions(catalog.query(&query), self.group_by);
-        self.visible = groups
-            .into_iter()
-            .flat_map(|group| {
-                group
-                    .sessions
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(index, session)| VisibleSession {
-                        group: (index == 0).then(|| group.key.clone()),
-                        session: session.clone(),
-                    })
-            })
-            .collect();
-        if self.visible.is_empty() {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(self.visible.len() - 1);
+        let sessions = catalog.query(&SessionQuery::default());
+        let mut indices = HashMap::<String, usize>::new();
+        for session in sessions {
+            let directory = session_directory(session);
+            let identity = directory_identity(&directory);
+            let index = match indices.get(&identity) {
+                Some(index) => *index,
+                None => {
+                    let index = self.directories.len();
+                    self.directories.push(DirectoryGroup {
+                        identity: identity.clone(),
+                        directory,
+                        sessions: Vec::new(),
+                    });
+                    indices.insert(identity, index);
+                    index
+                }
+            };
+            self.directories[index].sessions.push(session.clone());
         }
     }
 
-    /// 处理导航、搜索、分组、退出和选择按键，并按需返回最终动作。
+    /// 根据当前层级和搜索词刷新目录或会话列表。
+    fn rebuild_visible(&mut self) {
+        let matcher = SkimMatcherV2::default().ignore_case();
+        match self.level {
+            BrowserLevel::Directories => {
+                self.visible_directories = self
+                    .directories
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, group)| {
+                        self.search.is_empty()
+                            || matcher
+                                .fuzzy_match(&group.directory, &self.search)
+                                .is_some()
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                self.selected_directory =
+                    clamp_selection(self.selected_directory, self.visible_directories.len());
+                self.visible_sessions.clear();
+            }
+            BrowserLevel::Sessions => {
+                self.visible_sessions = self
+                    .active_group()
+                    .map(|group| {
+                        group
+                            .sessions
+                            .iter()
+                            .filter(|session| {
+                                self.search.is_empty()
+                                    || matcher
+                                        .fuzzy_match(&session.searchable_text(), &self.search)
+                                        .is_some()
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.selected_session =
+                    clamp_selection(self.selected_session, self.visible_sessions.len());
+            }
+        }
+    }
+
+    /// 处理两级导航、搜索、退出和恢复按键。
     fn handle_key(&mut self, key: KeyEvent) -> Option<TuiOutcome> {
         if self.search_mode {
             match key.code {
@@ -211,7 +278,15 @@ impl AppState {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Some(TuiOutcome::Quit),
+            KeyCode::Char('q') => Some(TuiOutcome::Quit),
+            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
+                if self.level == BrowserLevel::Sessions {
+                    self.back_to_directories();
+                    None
+                } else {
+                    Some(TuiOutcome::Quit)
+                }
+            }
             KeyCode::Char('/') => {
                 self.search_mode = true;
                 None
@@ -224,38 +299,99 @@ impl AppState {
                 self.move_selection(-1);
                 None
             }
-            KeyCode::Tab => {
-                self.group_by = self.group_by.next();
-                self.rebuild_visible();
-                None
-            }
-            KeyCode::Enter => self
-                .visible
-                .get(self.selected)
-                .map(|item| TuiOutcome::Resume(Box::new(item.session.clone()))),
+            KeyCode::Enter => self.activate_selection(),
             _ => None,
         }
     }
 
-    /// 在可见会话范围内循环移动选择位置。
+    /// 在当前层级的可见条目中循环移动选择位置。
     fn move_selection(&mut self, delta: isize) {
-        if self.visible.is_empty() {
+        let (selected, length) = match self.level {
+            BrowserLevel::Directories => {
+                (&mut self.selected_directory, self.visible_directories.len())
+            }
+            BrowserLevel::Sessions => (&mut self.selected_session, self.visible_sessions.len()),
+        };
+        if length == 0 {
             return;
         }
-        let length = self.visible.len() as isize;
-        self.selected = (self.selected as isize + delta).rem_euclid(length) as usize;
+        *selected = (*selected as isize + delta).rem_euclid(length as isize) as usize;
     }
 
-    /// 返回当前选中会话。
+    /// 进入选中目录，或从会话层返回待恢复会话。
+    fn activate_selection(&mut self) -> Option<TuiOutcome> {
+        match self.level {
+            BrowserLevel::Directories => {
+                let directory_index = *self.visible_directories.get(self.selected_directory)?;
+                self.active_directory = Some(self.directories[directory_index].identity.clone());
+                self.level = BrowserLevel::Sessions;
+                self.selected_session = 0;
+                self.search.clear();
+                self.rebuild_visible();
+                None
+            }
+            BrowserLevel::Sessions => self
+                .visible_sessions
+                .get(self.selected_session)
+                .cloned()
+                .map(|session| TuiOutcome::Resume(Box::new(session))),
+        }
+    }
+
+    /// 从会话层返回目录层，并清除当前目录内搜索。
+    fn back_to_directories(&mut self) {
+        self.level = BrowserLevel::Directories;
+        self.active_directory = None;
+        self.selected_session = 0;
+        self.search.clear();
+        self.search_mode = false;
+        self.rebuild_visible();
+    }
+
+    /// 返回当前活动目录分组。
+    fn active_group(&self) -> Option<&DirectoryGroup> {
+        let identity = self.active_directory.as_deref()?;
+        self.directories
+            .iter()
+            .find(|group| group.identity == identity)
+    }
+
+    /// 返回会话层当前选中的会话。
     fn selected_session(&self) -> Option<&Session> {
-        self.visible.get(self.selected).map(|item| &item.session)
+        self.visible_sessions.get(self.selected_session)
     }
 }
 
-/// 保存表格所需的可选分组标题和会话副本。
-struct VisibleSession {
-    group: Option<String>,
-    session: Session,
+/// 将越界选择收敛到可见列表，空列表统一返回零。
+fn clamp_selection(selected: usize, length: usize) -> usize {
+    if length == 0 {
+        0
+    } else {
+        selected.min(length - 1)
+    }
+}
+
+/// 返回会话的完整工作目录；缺失目录使用明确占位分组。
+fn session_directory(session: &Session) -> String {
+    session
+        .cwd
+        .as_deref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| format!("未指定目录 ({})", session.project))
+}
+
+/// 规范化目录分组标识，Windows 下忽略大小写和斜杠差异。
+fn directory_identity(directory: &str) -> String {
+    let trimmed = directory.trim_end_matches(&['\\', '/'][..]);
+    #[cfg(windows)]
+    {
+        trimmed.replace('/', "\\").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        trimmed.to_owned()
+    }
 }
 
 /// 根据终端尺寸选择布局并绘制完整界面。
@@ -285,41 +421,62 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     render_status(frame, chunks[2], state);
 }
 
-/// 绘制分组、会话数、警告数和搜索输入状态。
+/// 绘制当前层级、条目数量、警告数和搜索输入状态。
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(
             "agentmux",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "  分组:{}  会话:{}  警告:{}",
-            group_label(state.group_by),
-            state.visible.len(),
+        Span::raw("  "),
+    ];
+    match state.level {
+        BrowserLevel::Directories => title_spans.push(Span::raw(format!(
+            "目录:{}  警告:{}",
+            state.visible_directories.len(),
             state.warning_count
-        )),
-    ]);
+        ))),
+        BrowserLevel::Sessions => {
+            let directory = state
+                .active_group()
+                .map(|group| group.directory.as_str())
+                .unwrap_or("未知目录");
+            title_spans.push(Span::raw(format!(
+                "目录:{}  会话:{}  警告:{}",
+                truncate_width(directory, area.width.saturating_sub(24) as usize),
+                state.visible_sessions.len(),
+                state.warning_count
+            )));
+        }
+    }
+    let title = Line::from(title_spans);
     let mut lines = vec![title];
     if state.search_mode || !state.search.is_empty() {
-        let marker = if state.search_mode {
-            "搜索> "
-        } else {
-            "搜索: "
+        let marker = match (state.level, state.search_mode) {
+            (BrowserLevel::Directories, true) => "搜索目录> ",
+            (BrowserLevel::Sessions, true) => "搜索会话> ",
+            (BrowserLevel::Directories, false) => "目录搜索: ",
+            (BrowserLevel::Sessions, false) => "会话搜索: ",
         };
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(Color::Yellow)),
             Span::raw(truncate_width(
                 &state.search,
-                area.width.saturating_sub(8) as usize,
+                area.width.saturating_sub(display_width(marker) as u16) as usize,
             )),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
 
     if state.search_mode && area.height > 1 {
-        let cursor_x = 6usize
+        let marker = if state.level == BrowserLevel::Directories {
+            "搜索目录> "
+        } else {
+            "搜索会话> "
+        };
+        let cursor_x = display_width(marker)
             .saturating_add(display_width(&state.search))
             .min(area.width.saturating_sub(1) as usize);
         frame.set_cursor_position(Position::new(area.x + cursor_x as u16, area.y + 1));
@@ -340,8 +497,12 @@ fn render_loading(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// 根据宽度使用左右或上下布局绘制会话表格和详情。
+/// 第一层绘制全宽目录列表，第二层绘制会话表格和详情。
 fn render_content(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    if state.level == BrowserLevel::Directories {
+        render_directory_list(frame, area, state);
+        return;
+    }
     let direction = if area.width >= 96 && area.height >= 14 {
         Direction::Horizontal
     } else {
@@ -352,15 +513,68 @@ fn render_content(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .direction(direction)
         .constraints(constraints)
         .split(area);
-    render_table(frame, chunks[0], state);
+    render_session_table(frame, chunks[0], state);
     render_detail(frame, chunks[1], state.selected_session());
 }
 
-/// 绘制分组、更新时间和标题表格，并保持选择高亮。
-fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    if state.visible.is_empty() {
+/// 绘制第一层目录列表，不混入会话标题或详情。
+fn render_directory_list(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    if state.visible_directories.is_empty() {
         let message = if state.search.is_empty() {
-            "未找到可恢复的交互式会话。"
+            "未找到包含交互式会话的目录。"
+        } else {
+            "没有目录匹配当前搜索。"
+        };
+        frame.render_widget(
+            Paragraph::new(message).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(symbols::border::PLAIN)
+                    .title(" 目录 "),
+            ),
+            area,
+        );
+        return;
+    }
+
+    let rows = state.visible_directories.iter().filter_map(|index| {
+        state.directories.get(*index).map(|group| {
+            Row::new([Cell::from(truncate_width(
+                &group.directory,
+                area.width.saturating_sub(5) as usize,
+            ))])
+        })
+    });
+    let header = Row::new(["目录"]).style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table = Table::new(rows, [Constraint::Min(8)])
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(symbols::border::PLAIN)
+                .title(" 目录 "),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut table_state = TableState::default();
+    table_state.select(Some(state.selected_directory));
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+/// 绘制当前目录内的更新时间和会话标题。
+fn render_session_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
+    if state.visible_sessions.is_empty() {
+        let message = if state.search.is_empty() {
+            "当前目录没有可恢复的交互式会话。"
         } else {
             "没有会话匹配当前搜索。"
         };
@@ -376,49 +590,37 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         return;
     }
 
-    let group_width = area.width.saturating_sub(24).clamp(8, 18);
-    let rows = state.visible.iter().map(|item| {
+    let rows = state.visible_sessions.iter().map(|session| {
         Row::new(vec![
+            Cell::from(session.updated_at.format("%m-%d %H:%M").to_string()),
             Cell::from(truncate_width(
-                item.group.as_deref().unwrap_or(""),
-                group_width as usize,
-            )),
-            Cell::from(item.session.updated_at.format("%m-%d %H:%M").to_string()),
-            Cell::from(truncate_width(
-                item.session.display_title(),
-                area.width.saturating_sub(group_width + 18) as usize,
+                session.display_title(),
+                area.width.saturating_sub(16) as usize,
             )),
         ])
     });
-    let header = Row::new(["分组", "更新时间", "标题"]).style(
+    let header = Row::new(["更新时间", "标题"]).style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(group_width),
-            Constraint::Length(11),
-            Constraint::Min(8),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_set(symbols::border::PLAIN)
-            .title(" 会话 "),
-    )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("› ");
+    let table = Table::new(rows, [Constraint::Length(11), Constraint::Min(8)])
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(symbols::border::PLAIN)
+                .title(" 会话 "),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
     let mut table_state = TableState::default();
-    table_state.select(Some(state.selected));
+    table_state.select(Some(state.selected_session));
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
@@ -482,10 +684,15 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, session: Option<&Session>) {
 
 /// 绘制快捷键提示和可选恢复失败状态。
 fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let shortcuts = if area.width < 72 {
-        "↑↓/jk 移动  / 搜索  Tab 分组  Enter 恢复  q 退出"
-    } else {
-        "方向键或 j/k 移动  / 搜索  Tab 切换分组  Enter 恢复  q/Esc 退出"
+    let shortcuts = match (state.level, area.width < 72) {
+        (BrowserLevel::Directories, true) => "↑↓/jk 移动  / 搜索  Enter 进入  q/Esc 退出",
+        (BrowserLevel::Directories, false) => {
+            "方向键或 j/k 移动  / 搜索目录  Enter 进入目录  q/Esc 退出"
+        }
+        (BrowserLevel::Sessions, true) => "↑↓/jk 移动  / 搜索  Enter 恢复  Esc/← 返回  q 退出",
+        (BrowserLevel::Sessions, false) => {
+            "方向键或 j/k 移动  / 搜索会话  Enter 恢复  Esc/← 返回目录  q 退出"
+        }
     };
     let mut lines = Vec::new();
     if let Some(error) = state.status_error.as_deref() {
@@ -510,16 +717,6 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
         ),
         Span::raw(value.to_owned()),
     ])
-}
-
-/// 返回分组维度的中文短标签。
-fn group_label(group_by: GroupBy) -> &'static str {
-    match group_by {
-        GroupBy::Project => "项目",
-        GroupBy::Date => "日期",
-        GroupBy::Source => "来源",
-        GroupBy::Provider => "Provider",
-    }
 }
 
 /// 返回交互类型的中文标签。
@@ -587,7 +784,7 @@ mod tests {
     use super::*;
 
     /// 创建包含中文路径和摘要的 TUI 测试会话。
-    fn test_session(id: &str, hour: u32) -> Session {
+    fn test_session(id: &str, hour: u32, directory: &str) -> Session {
         let timestamp = Utc
             .with_ymd_and_hms(2026, 7, 10, hour, 0, 0)
             .single()
@@ -597,8 +794,12 @@ mod tests {
             source: SourceId::new("codex"),
             title: Some("实现跨平台会话恢复".to_owned()),
             summary: Some("在窄终端中安全显示中文路径和摘要。".to_owned()),
-            cwd: Some(PathBuf::from(r"D:\项目\智能助手")),
-            project: "智能助手".to_owned(),
+            cwd: Some(PathBuf::from(directory)),
+            project: PathBuf::from(directory)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_owned(),
             created_at: timestamp,
             updated_at: timestamp,
             model: Some("gpt-5".to_owned()),
@@ -614,32 +815,58 @@ mod tests {
     fn loaded_state() -> AppState {
         let mut state = AppState::new(Some("上次恢复失败，退出码 2".to_owned()));
         state.load(ScanReport {
-            sessions: vec![test_session("newer", 14), test_session("older", 12)],
+            sessions: vec![
+                test_session("newer", 14, r"D:\项目\智能助手"),
+                test_session("older", 12, r"D:\项目\智能助手"),
+                test_session("another", 13, r"D:\项目\另一个项目"),
+            ],
             warnings: Vec::new(),
         });
         state
     }
 
-    /// 验证导航循环、搜索输入和分组切换状态。
+    /// 验证先选择目录，再浏览会话，并可返回目录层。
     #[test]
-    fn handles_navigation_search_and_grouping() {
+    fn navigates_directories_before_sessions() {
         let mut state = loaded_state();
+        assert_eq!(state.level, BrowserLevel::Directories);
+        assert_eq!(state.visible_directories.len(), 2);
+
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.level, BrowserLevel::Sessions);
+        assert_eq!(state.visible_sessions.len(), 2);
+
         state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(state.selected, 1);
-        state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(state.selected, 0);
-        state.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        state.handle_key(KeyEvent::new(KeyCode::Char('智'), KeyModifiers::NONE));
-        assert!(state.search_mode);
-        assert_eq!(state.visible.len(), 2);
+        assert_eq!(state.selected_session, 1);
+        let outcome = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Some(TuiOutcome::Resume(_))));
+
         state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(state.group_by, GroupBy::Date);
+        assert_eq!(state.level, BrowserLevel::Directories);
+        assert!(state.active_directory.is_none());
     }
 
-    /// 验证窄终端和中文内容渲染不会越界或 panic。
+    /// 验证目录层和会话层分别使用各自的搜索范围。
     #[test]
-    fn renders_narrow_terminal_with_chinese_text() {
+    fn searches_directories_and_current_directory_sessions() {
+        let mut state = loaded_state();
+        state.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('另'), KeyModifiers::NONE));
+        assert!(state.search_mode);
+        assert_eq!(state.visible_directories.len(), 1);
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.level, BrowserLevel::Sessions);
+        assert_eq!(state.visible_sessions.len(), 1);
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('不'), KeyModifiers::NONE));
+        assert!(state.visible_sessions.is_empty());
+    }
+
+    /// 验证第一层窄终端只渲染目录，不渲染会话标题。
+    #[test]
+    fn first_level_renders_only_directories() {
         let backend = TestBackend::new(48, 16);
         let mut terminal = Terminal::new(backend).expect("应能创建测试终端");
         let mut state = loaded_state();
@@ -648,6 +875,33 @@ mod tests {
             .draw(|frame| render(frame, &mut state))
             .expect("窄终端渲染应成功");
 
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let compact = content.replace(' ', "");
+        assert!(compact.contains("智能助手"));
+        assert!(compact.contains("另一个项目"));
+        assert!(!compact.contains("实现跨平台会话恢复"));
+        assert_eq!(terminal.size().expect("应能读取终端尺寸").width, 48);
+    }
+
+    /// 验证第二层在窄终端中渲染会话标题和详情时不会越界。
+    #[test]
+    fn renders_session_level_in_narrow_terminal() {
+        let backend = TestBackend::new(48, 16);
+        let mut terminal = Terminal::new(backend).expect("应能创建测试终端");
+        let mut state = loaded_state();
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("会话层窄终端渲染应成功");
+
+        assert_eq!(state.level, BrowserLevel::Sessions);
         assert_eq!(terminal.size().expect("应能读取终端尺寸").width, 48);
     }
 
