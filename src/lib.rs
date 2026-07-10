@@ -1,0 +1,4 @@
+//! agentmux 核心库，提供统一会话模型、来源接口与命令实现。
+
+pub mod domain;
+pub mod provider;
