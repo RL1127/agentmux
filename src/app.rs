@@ -38,17 +38,41 @@ fn run_interactive() -> Result<i32> {
             TuiOutcome::Resume(session) => match execute_session(&registry, &session, false) {
                 Ok(execution) if execution.exit_code == 0 => return Ok(0),
                 Ok(execution) => {
-                    last_error = Some(format!(
-                        "恢复失败: {} 退出码 {}",
-                        session.id, execution.exit_code
-                    ));
+                    let message =
+                        format!("恢复失败: {} 退出码 {}", session.id, execution.exit_code);
+                    if wait_after_resume_failure(&message)? {
+                        return Ok(execution.exit_code);
+                    }
+                    last_error = Some(message);
                 }
                 Err(error) => {
-                    last_error = Some(format!("恢复失败: {error:#}"));
+                    let message = format!("恢复失败: {error:#}");
+                    if wait_after_resume_failure(&message)? {
+                        return Ok(1);
+                    }
+                    last_error = Some(message);
                 }
             },
         }
     }
+}
+
+/// 在 Codex 恢复失败后保留普通终端输出，等待用户决定返回列表或退出。
+fn wait_after_resume_failure(message: &str) -> Result<bool> {
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "\n{message}")?;
+    writeln!(stderr, "Codex 的原始错误输出保留在上方。")?;
+    write!(stderr, "按 Enter 返回 agentmux，输入 q 后按 Enter 退出: ")?;
+    stderr.flush()?;
+
+    let mut answer = String::new();
+    let bytes_read = io::stdin().read_line(&mut answer)?;
+    Ok(bytes_read == 0 || resume_failure_requests_quit(&answer))
+}
+
+/// 判断恢复失败提示中的用户输入是否表示退出应用。
+fn resume_failure_requests_quit(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "q" | "quit")
 }
 
 /// 执行已解析命令；显式 writer 便于测试且确保输出编码为 UTF-8 字节。
@@ -234,4 +258,18 @@ fn run_sources(json: bool, stdout: &mut impl Write) -> Result<i32> {
 fn run_completion(shell: Shell, stdout: &mut impl Write) {
     let mut command = Cli::command();
     clap_complete::generate(shell, &mut command, "agentmux", stdout);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_failure_requests_quit;
+
+    /// 验证恢复失败提示只把明确的退出输入识别为退出。
+    #[test]
+    fn parses_resume_failure_choice() {
+        assert!(resume_failure_requests_quit("q\r\n"));
+        assert!(resume_failure_requests_quit("QUIT"));
+        assert!(!resume_failure_requests_quit("\r\n"));
+        assert!(!resume_failure_requests_quit("return"));
+    }
 }
