@@ -34,15 +34,16 @@ fn run_interactive(open_in_app: bool) -> Result<i32> {
     let registry = Arc::new(default_registry()?);
     let mut last_error = None;
     loop {
-        match tui::run(Arc::clone(&registry), last_error.take())? {
+        match tui::run(Arc::clone(&registry), last_error.take(), open_in_app)? {
             TuiOutcome::Quit => return Ok(0),
-            TuiOutcome::Resume(session) => match execute_session(&registry, &session, false) {
-                Ok(execution) if execution.exit_code == 0 => {
-                    if open_in_app && let Err(error) = open_session_in_app(&registry, &session) {
-                        eprintln!("警告: Codex 会话已恢复，但无法打开 App: {error:#}");
-                    }
-                    return Ok(0);
+            TuiOutcome::OpenInApp(session) => match open_session_in_app(&registry, &session) {
+                Ok(()) => return Ok(0),
+                Err(error) => {
+                    last_error = Some(format!("无法在 App 打开会话: {error:#}"));
                 }
+            },
+            TuiOutcome::ResumeCli(session) => match execute_session(&registry, &session, false) {
+                Ok(execution) if execution.exit_code == 0 => return Ok(0),
                 Ok(execution) => {
                     let message =
                         format!("恢复失败: {} 退出码 {}", session.id, execution.exit_code);

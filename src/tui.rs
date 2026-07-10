@@ -31,24 +31,30 @@ use crate::provider::ProviderRegistry;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 表示用户从 TUI 退出或选择了待恢复会话。
+/// 表示用户从 TUI 退出、打开 App 会话或选择 CLI 恢复。
 #[derive(Debug)]
 pub enum TuiOutcome {
     /// 用户按 q 或 Esc 正常退出。
     Quit,
-    /// 用户按 Enter 选择会话。
-    Resume(Box<Session>),
+    /// 用户按 Enter 请求在来源桌面应用中打开会话。
+    OpenInApp(Box<Session>),
+    /// 用户按 c 请求通过来源官方 CLI 恢复会话。
+    ResumeCli(Box<Session>),
 }
 
 /// 启动 TUI，后台扫描全部来源，并在退出前可靠恢复终端状态。
-pub fn run(registry: Arc<ProviderRegistry>, initial_error: Option<String>) -> Result<TuiOutcome> {
+pub fn run(
+    registry: Arc<ProviderRegistry>,
+    initial_error: Option<String>,
+    open_in_app: bool,
+) -> Result<TuiOutcome> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let _ = sender.send(registry.scan_all());
     });
 
     let mut terminal = TerminalSession::start()?;
-    let mut state = AppState::new(initial_error);
+    let mut state = AppState::new(initial_error, open_in_app);
     run_loop(terminal.terminal_mut(), &receiver, &mut state)
 }
 
@@ -156,11 +162,12 @@ struct AppState {
     loading: bool,
     warning_count: usize,
     status_error: Option<String>,
+    open_in_app: bool,
 }
 
 impl AppState {
-    /// 创建处于扫描状态的目录浏览器，可选展示上一次恢复失败信息。
-    fn new(initial_error: Option<String>) -> Self {
+    /// 创建处于扫描状态的目录浏览器，并设置 Enter 的默认打开方式。
+    fn new(initial_error: Option<String>, open_in_app: bool) -> Self {
         Self {
             catalog: None,
             directories: Vec::new(),
@@ -175,6 +182,7 @@ impl AppState {
             loading: true,
             warning_count: 0,
             status_error: initial_error,
+            open_in_app,
         }
     }
 
@@ -299,6 +307,9 @@ impl AppState {
                 self.move_selection(-1);
                 None
             }
+            KeyCode::Char('c') if self.level == BrowserLevel::Sessions => {
+                self.selected_cli_resume()
+            }
             KeyCode::Enter => self.activate_selection(),
             _ => None,
         }
@@ -318,7 +329,7 @@ impl AppState {
         *selected = (*selected as isize + delta).rem_euclid(length as isize) as usize;
     }
 
-    /// 进入选中目录，或从会话层返回待恢复会话。
+    /// 进入选中目录，或按当前首选方式打开选中会话。
     fn activate_selection(&mut self) -> Option<TuiOutcome> {
         match self.level {
             BrowserLevel::Directories => {
@@ -330,12 +341,23 @@ impl AppState {
                 self.rebuild_visible();
                 None
             }
-            BrowserLevel::Sessions => self
-                .visible_sessions
-                .get(self.selected_session)
-                .cloned()
-                .map(|session| TuiOutcome::Resume(Box::new(session))),
+            BrowserLevel::Sessions => {
+                let session = self.visible_sessions.get(self.selected_session)?.clone();
+                Some(if self.open_in_app {
+                    TuiOutcome::OpenInApp(Box::new(session))
+                } else {
+                    TuiOutcome::ResumeCli(Box::new(session))
+                })
+            }
         }
+    }
+
+    /// 返回通过来源官方 CLI 恢复当前选中会话的结果。
+    fn selected_cli_resume(&self) -> Option<TuiOutcome> {
+        self.visible_sessions
+            .get(self.selected_session)
+            .cloned()
+            .map(|session| TuiOutcome::ResumeCli(Box::new(session)))
     }
 
     /// 从会话层返回目录层，并清除当前目录内搜索。
@@ -689,9 +711,15 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         (BrowserLevel::Directories, false) => {
             "方向键或 j/k 移动  / 搜索目录  Enter 进入目录  q/Esc 退出"
         }
-        (BrowserLevel::Sessions, true) => "↑↓/jk 移动  / 搜索  Enter 恢复  Esc/← 返回  q 退出",
+        (BrowserLevel::Sessions, true) if state.open_in_app => {
+            "↑↓/jk 移动  Enter App  c CLI  Esc/← 返回  q 退出"
+        }
+        (BrowserLevel::Sessions, true) => "↑↓/jk 移动  / 搜索  Enter/c CLI  Esc/← 返回  q 退出",
+        (BrowserLevel::Sessions, false) if state.open_in_app => {
+            "方向键或 j/k 移动  / 搜索会话  Enter 在 App 打开  c CLI 恢复  Esc/← 返回目录  q 退出"
+        }
         (BrowserLevel::Sessions, false) => {
-            "方向键或 j/k 移动  / 搜索会话  Enter 恢复  Esc/← 返回目录  q 退出"
+            "方向键或 j/k 移动  / 搜索会话  Enter/c CLI 恢复  Esc/← 返回目录  q 退出"
         }
     };
     let mut lines = Vec::new();
@@ -813,7 +841,7 @@ mod tests {
 
     /// 创建已完成扫描的界面状态。
     fn loaded_state() -> AppState {
-        let mut state = AppState::new(Some("上次恢复失败，退出码 2".to_owned()));
+        let mut state = AppState::new(Some("上次恢复失败，退出码 2".to_owned()), true);
         state.load(ScanReport {
             sessions: vec![
                 test_session("newer", 14, r"D:\项目\智能助手"),
@@ -839,7 +867,10 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(state.selected_session, 1);
         let outcome = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(outcome, Some(TuiOutcome::Resume(_))));
+        assert!(matches!(outcome, Some(TuiOutcome::OpenInApp(_))));
+
+        let outcome = state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(outcome, Some(TuiOutcome::ResumeCli(_))));
 
         state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(state.level, BrowserLevel::Directories);
@@ -910,5 +941,19 @@ mod tests {
     fn truncates_by_display_width() {
         assert_eq!(truncate_width("中文路径", 5), "中文…");
         assert_eq!(display_width("中文"), 4);
+    }
+
+    /// 验证关闭 App 导航后 Enter 会回退为官方 CLI 恢复。
+    #[test]
+    fn enter_resumes_cli_when_app_navigation_is_disabled() {
+        let mut state = AppState::new(None, false);
+        state.load(ScanReport {
+            sessions: vec![test_session("session", 14, r"D:\项目\智能助手")],
+            warnings: Vec::new(),
+        });
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let outcome = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, Some(TuiOutcome::ResumeCli(_))));
     }
 }
