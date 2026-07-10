@@ -8,10 +8,12 @@ use chrono::Utc;
 use clap::Parser;
 
 use crate::catalog::{SessionCatalog, SessionQuery, group_sessions};
-use crate::cli::{AgentmuxCommand, Cli, ListArgs, parse_since};
+use crate::cli::{AgentmuxCommand, Cli, ListArgs, ResumeArgs, parse_since};
+use crate::domain::{CommandSpec, Session};
 use crate::output::write_list;
 use crate::provider::ProviderRegistry;
 use crate::provider::codex::CodexProvider;
+use crate::resume;
 use crate::tui::{self, TuiOutcome};
 
 /// 从当前进程参数运行 agentmux，并返回应传递给操作系统的退出码。
@@ -28,10 +30,22 @@ pub fn run() -> Result<i32> {
 /// 启动默认交互界面，并返回退出或选择结果。
 fn run_interactive() -> Result<i32> {
     let registry = Arc::new(default_registry()?);
-    match tui::run(registry, None)? {
-        TuiOutcome::Quit => Ok(0),
-        TuiOutcome::Resume(session) => {
-            bail!("已选择会话 {}，恢复执行层尚未接入", session.id)
+    let mut last_error = None;
+    loop {
+        match tui::run(Arc::clone(&registry), last_error.take())? {
+            TuiOutcome::Quit => return Ok(0),
+            TuiOutcome::Resume(session) => match execute_session(&registry, &session, false) {
+                Ok(execution) if execution.exit_code == 0 => return Ok(0),
+                Ok(execution) => {
+                    last_error = Some(format!(
+                        "恢复失败: {} 退出码 {}",
+                        session.id, execution.exit_code
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(format!("恢复失败: {error:#}"));
+                }
+            },
         }
     }
 }
@@ -43,9 +57,7 @@ pub fn run_cli(cli: Cli, mut stdout: impl Write, mut stderr: impl Write) -> Resu
             run_list(args, &mut stdout, &mut stderr)?;
             Ok(0)
         }
-        Some(AgentmuxCommand::Resume(_)) => {
-            bail!("resume 命令尚未接入执行层")
-        }
+        Some(AgentmuxCommand::Resume(args)) => run_resume(args, &mut stdout, &mut stderr),
         Some(AgentmuxCommand::Doctor(_)) => {
             bail!("doctor 命令尚未接入诊断输出")
         }
@@ -104,4 +116,55 @@ fn run_list(args: ListArgs, stdout: &mut impl Write, stderr: &mut impl Write) ->
         }
     }
     Ok(())
+}
+
+/// 执行显式 resume 子命令，并把 Codex 退出码原样返回给 main。
+fn run_resume(args: ResumeArgs, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
+    if args.repair_provider {
+        bail!("--repair-provider 将在 provider 配置修复模块中处理");
+    }
+    let registry = default_registry()?;
+    let catalog = SessionCatalog::from_report(registry.scan_all());
+    let session = catalog
+        .find(&args.session_id, None)
+        .cloned()
+        .with_context(|| format!("未找到会话 {}", args.session_id))?;
+    let execution = execute_session(&registry, &session, args.dry_run)?;
+    if args.dry_run {
+        writeln!(stdout, "将执行: {}", execution.command)?;
+    } else if execution.exit_code != 0 {
+        writeln!(
+            stderr,
+            "恢复命令失败，会话 {}，退出码 {}",
+            session.id, execution.exit_code
+        )?;
+    }
+    Ok(execution.exit_code)
+}
+
+/// 检查会话恢复状态、构造来源官方命令并交给终端执行器。
+fn execute_session(
+    registry: &ProviderRegistry,
+    session: &Session,
+    dry_run: bool,
+) -> Result<resume::ResumeExecution> {
+    let command = prepare_resume_command(registry, session)?;
+    Ok(resume::execute(&command, dry_run)?)
+}
+
+/// 通过会话来源查找 provider，完成恢复检查并构造官方命令。
+fn prepare_resume_command(registry: &ProviderRegistry, session: &Session) -> Result<CommandSpec> {
+    let provider = registry
+        .get(&session.source)
+        .with_context(|| format!("来源 {} 未注册", session.source))?;
+    let status = provider.check_resume(session)?;
+    if !status.is_ready() {
+        bail!(
+            "{}",
+            status
+                .message
+                .unwrap_or_else(|| "当前会话不可恢复".to_owned())
+        );
+    }
+    Ok(provider.build_resume_command(session)?)
 }
