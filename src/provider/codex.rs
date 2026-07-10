@@ -159,10 +159,8 @@ impl CodexProvider {
         }
 
         let selected = select_metadata(metadata, filename_id.as_deref());
-        let id = selected
-            .as_ref()
-            .and_then(|item| item.id.clone())
-            .or(filename_id)
+        let id = filename_id
+            .or_else(|| selected.as_ref().and_then(|item| item.id.clone()))
             .filter(|value| !value.trim().is_empty());
         let Some(id) = id else {
             warnings.push(
@@ -370,11 +368,11 @@ impl SessionProvider for CodexProvider {
                 operation: "恢复其他来源会话",
             });
         }
-        if session.id.trim().is_empty() {
+        if Uuid::parse_str(&session.id).is_err() {
             return Err(ProviderError::InvalidData {
                 path: session.raw_path.clone(),
                 line: None,
-                reason: "会话 ID 为空".to_owned(),
+                reason: "Codex 会话 ID 不是合法 UUID".to_owned(),
             });
         }
         Ok(CommandSpec::new(
@@ -920,5 +918,48 @@ mod tests {
             .build_resume_command(&session)
             .expect("应能构造恢复命令");
         assert_eq!(command.display(), format!("codex resume {SESSION_ID}"));
+    }
+
+    /// 验证异常 payload id 不会覆盖 rollout 文件名中的可信 UUID。
+    #[test]
+    fn filename_uuid_takes_precedence_over_payload_id() {
+        let body = concat!(
+            "{\"timestamp\":\"2026-07-10T03:21:49Z\",\"type\":\"session_meta\",\"payload\":{",
+            "\"id\":\"unsafe & command\",\"timestamp\":\"2026-07-10T03:21:49Z\",",
+            "\"cwd\":\"D:\\\\项目\\\\智能助手\",\"source\":\"vscode\",\"thread_source\":\"user\",",
+            "\"model_provider\":\"custom\"}}\n"
+        );
+        let (directory, _) = fixture(body);
+        let provider = CodexProvider::with_home(directory.path());
+
+        let session = provider
+            .scan_sessions()
+            .expect("扫描应成功")
+            .sessions
+            .remove(0);
+
+        assert_eq!(session.id, SESSION_ID);
+        assert!(
+            provider.build_resume_command(&session).is_ok(),
+            "文件名 UUID 应可安全构造恢复命令"
+        );
+    }
+
+    /// 验证无法追溯到 UUID 的会话不会进入官方恢复命令。
+    #[test]
+    fn rejects_non_uuid_resume_id() {
+        let (directory, _) = fixture(&valid_session());
+        let provider = CodexProvider::with_home(directory.path());
+        let mut session = provider
+            .scan_sessions()
+            .expect("扫描应成功")
+            .sessions
+            .remove(0);
+        session.id = "unsafe & command".to_owned();
+
+        assert!(matches!(
+            provider.build_resume_command(&session),
+            Err(ProviderError::InvalidData { .. })
+        ));
     }
 }
