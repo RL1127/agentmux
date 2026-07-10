@@ -223,7 +223,7 @@ impl CodexProvider {
 
     /// 判断配置的 CLI 名称或路径能否在当前环境中解析。
     fn cli_available(&self) -> bool {
-        resolve_program(&self.cli_program).is_some()
+        crate::resume::command_for(&self.cli_program, &[]).is_some()
     }
 }
 
@@ -719,57 +719,6 @@ fn bearer_pattern() -> &'static Regex {
 fn openai_key_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| Regex::new(r"\bsk-[A-Za-z0-9_-]{12,}\b").expect("静态密钥正则必须有效"))
-}
-
-/// 在显式路径或 PATH 中解析程序；Windows 同时考虑 PATHEXT 脚本包装器。
-fn resolve_program(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 || program.is_absolute() {
-        return program.is_file().then(|| program.to_path_buf());
-    }
-    let path_value = env::var_os("PATH")?;
-    let names = executable_names(program);
-    env::split_paths(&path_value)
-        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
-        .find(|candidate| candidate.is_file())
-}
-
-/// 构造当前平台可执行文件候选名称。
-fn executable_names(program: &Path) -> Vec<OsString> {
-    let base = program.as_os_str().to_os_string();
-    #[cfg(windows)]
-    {
-        if program.extension().is_some() {
-            return vec![base];
-        }
-        let extensions = env::var_os("PATHEXT")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(';')
-                    .filter(|item| !item.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    ".COM".to_owned(),
-                    ".EXE".to_owned(),
-                    ".BAT".to_owned(),
-                    ".CMD".to_owned(),
-                ]
-            });
-        let mut names = vec![base.clone()];
-        names.extend(extensions.into_iter().map(|extension| {
-            let mut name = base.clone();
-            name.push(extension);
-            name
-        }));
-        names
-    }
-    #[cfg(not(windows))]
-    {
-        vec![base]
-    }
 }
 
 #[cfg(test)]

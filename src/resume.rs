@@ -175,13 +175,14 @@ fn executable_names(program: &Path) -> Vec<OsString> {
                     ".CMD".to_owned(),
                 ]
             });
-        let mut names = vec![base.clone()];
-        names.extend(extensions.into_iter().map(|extension| {
-            let mut name = base.clone();
-            name.push(extension);
-            name
-        }));
-        names
+        extensions
+            .into_iter()
+            .map(|extension| {
+                let mut name = base.clone();
+                name.push(extension);
+                name
+            })
+            .collect()
     }
     #[cfg(not(windows))]
     {
@@ -254,5 +255,19 @@ mod tests {
 
         let exit_code = run_inherited(&spec).expect("模拟子进程应能执行");
         assert_eq!(exit_code, 37);
+    }
+
+    /// 验证 Windows 不会优先选择 npm 生成的无扩展名 shell shim。
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_exclude_extensionless_shim() {
+        let candidates = executable_names(Path::new("codex"));
+
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| Path::new(candidate).extension().is_some())
+        );
     }
 }
