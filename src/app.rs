@@ -1,6 +1,7 @@
 //! 负责命令分发，并将 CLI/TUI 与来源注册表连接起来。
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -11,13 +12,28 @@ use crate::cli::{AgentmuxCommand, Cli, ListArgs, parse_since};
 use crate::output::write_list;
 use crate::provider::ProviderRegistry;
 use crate::provider::codex::CodexProvider;
+use crate::tui::{self, TuiOutcome};
 
 /// 从当前进程参数运行 agentmux，并返回应传递给操作系统的退出码。
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
+    if cli.command.is_none() {
+        return run_interactive();
+    }
     let stdout = io::stdout();
     let stderr = io::stderr();
     run_cli(cli, stdout.lock(), stderr.lock())
+}
+
+/// 启动默认交互界面，并返回退出或选择结果。
+fn run_interactive() -> Result<i32> {
+    let registry = Arc::new(default_registry()?);
+    match tui::run(registry, None)? {
+        TuiOutcome::Quit => Ok(0),
+        TuiOutcome::Resume(session) => {
+            bail!("已选择会话 {}，恢复执行层尚未接入", session.id)
+        }
+    }
 }
 
 /// 执行已解析命令；显式 writer 便于测试且确保输出编码为 UTF-8 字节。
