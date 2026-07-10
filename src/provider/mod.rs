@@ -88,6 +88,11 @@ pub trait SessionProvider: Send + Sync {
     /// 使用来源官方入口构造恢复命令，调用方不得自行重放会话内容。
     fn build_resume_command(&self, session: &Session) -> Result<CommandSpec, ProviderError>;
 
+    /// 构造来源桌面应用的会话 URI；默认表示该来源没有桌面导航能力。
+    fn build_app_uri(&self, _session: &Session) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     /// 检查 CLI、配置和会话目录，并返回不含认证信息的诊断项。
     fn diagnose(&self) -> Vec<Diagnostic>;
 

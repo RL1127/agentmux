@@ -1,7 +1,7 @@
 //! 定义 agentmux 命令行参数和时间过滤解析。
 
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use clap_complete::Shell;
 use thiserror::Error;
 
@@ -15,6 +15,14 @@ use crate::catalog::GroupBy;
     about = "统一检索、诊断和恢复 AI Coding Agent 会话"
 )]
 pub struct Cli {
+    /// 恢复成功后自动打开对应的 Codex App 任务；传入该参数可关闭。
+    #[arg(
+        long = "no-open-in-app",
+        global = true,
+        action = ArgAction::SetFalse,
+        default_value_t = true
+    )]
+    pub open_in_app: bool,
     /// 要执行的非交互子命令；省略时启动 TUI。
     #[command(subcommand)]
     pub command: Option<AgentmuxCommand>,

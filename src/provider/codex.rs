@@ -240,6 +240,7 @@ impl SessionProvider for CodexProvider {
                 ProviderCapability::Resume,
                 ProviderCapability::Diagnose,
                 ProviderCapability::RepairProvider,
+                ProviderCapability::OpenInApp,
             ],
         }
     }
@@ -379,6 +380,22 @@ impl SessionProvider for CodexProvider {
             self.cli_program.clone(),
             vec![OsString::from("resume"), OsString::from(&session.id)],
         ))
+    }
+
+    /// 构造 Codex App 注册的线程 URL，不直接访问 App 私有数据库或 IPC。
+    fn build_app_uri(&self, session: &Session) -> Result<Option<String>, ProviderError> {
+        if session.source.as_str() != SOURCE_ID {
+            return Err(ProviderError::Unsupported {
+                provider_id: SourceId::new(SOURCE_ID),
+                operation: "打开其他来源桌面会话",
+            });
+        }
+        let id = Uuid::parse_str(&session.id).map_err(|_| ProviderError::InvalidData {
+            path: session.raw_path.clone(),
+            line: None,
+            reason: "Codex 会话 ID 不是合法 UUID".to_owned(),
+        })?;
+        Ok(Some(format!("codex://threads/{id}")))
     }
 
     /// 检查 Codex CLI、配置文件和会话目录，不解析或输出认证内容。
@@ -867,6 +884,24 @@ mod tests {
             .build_resume_command(&session)
             .expect("应能构造恢复命令");
         assert_eq!(command.display(), format!("codex resume {SESSION_ID}"));
+    }
+
+    /// 验证 Codex App URI 使用已注册的线程路由且只包含合法 UUID。
+    #[test]
+    fn builds_codex_app_thread_uri() {
+        let (directory, _) = fixture(&valid_session());
+        let provider = CodexProvider::with_home(directory.path());
+        let session = provider
+            .scan_sessions()
+            .expect("扫描应成功")
+            .sessions
+            .remove(0);
+
+        let uri = provider.build_app_uri(&session).expect("应能构造 App URI");
+        assert_eq!(
+            uri.as_deref(),
+            Some("codex://threads/019f4a0b-a42e-7103-ac37-2ceffc73cb52")
+        );
     }
 
     /// 验证异常 payload id 不会覆盖 rollout 文件名中的可信 UUID。

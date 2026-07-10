@@ -156,6 +156,7 @@ fn capability_label(capability: &ProviderCapability) -> &'static str {
         ProviderCapability::Resume => "resume",
         ProviderCapability::Diagnose => "diagnose",
         ProviderCapability::RepairProvider => "repair-provider",
+        ProviderCapability::OpenInApp => "open-in-app",
     }
 }
 

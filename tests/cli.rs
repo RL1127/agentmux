@@ -227,6 +227,23 @@ fn resume_dry_run_prints_official_command() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         stdout(&output).trim(),
+        format!(
+            "将执行: codex resume {INTERACTIVE_ID}\n恢复成功后将打开: codex://threads/{INTERACTIVE_ID}"
+        )
+    );
+}
+
+/// 验证全局关闭参数会让 dry-run 只展示官方恢复命令。
+#[test]
+fn resume_can_disable_app_navigation() {
+    let fixture = fixture();
+    let output = agentmux(&fixture)
+        .args(["resume", INTERACTIVE_ID, "--dry-run", "--no-open-in-app"])
+        .output()
+        .expect("resume dry-run 应能执行");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
         format!("将执行: codex resume {INTERACTIVE_ID}")
     );
 }
@@ -258,7 +275,7 @@ fn doctor_sources_and_completion_are_available() {
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     let diagnostics: Value =
         serde_json::from_slice(&doctor.stdout).expect("doctor 应输出合法 JSON");
-    assert_eq!(diagnostics.as_array().map(Vec::len), Some(3));
+    assert_eq!(diagnostics.as_array().map(Vec::len), Some(4));
 
     let sources = agentmux(&fixture)
         .args(["sources", "--json"])

@@ -8,6 +8,7 @@ use chrono::Utc;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 
+use crate::app_navigation;
 use crate::catalog::{SessionCatalog, SessionQuery, group_sessions};
 use crate::cli::{AgentmuxCommand, Cli, ListArgs, ResumeArgs, parse_since};
 use crate::domain::{CommandSpec, DiagnosticSeverity, RepairOptions, Session};
@@ -21,7 +22,7 @@ use crate::tui::{self, TuiOutcome};
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
     if cli.command.is_none() {
-        return run_interactive();
+        return run_interactive(cli.open_in_app);
     }
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -29,14 +30,19 @@ pub fn run() -> Result<i32> {
 }
 
 /// 启动默认交互界面，并返回退出或选择结果。
-fn run_interactive() -> Result<i32> {
+fn run_interactive(open_in_app: bool) -> Result<i32> {
     let registry = Arc::new(default_registry()?);
     let mut last_error = None;
     loop {
         match tui::run(Arc::clone(&registry), last_error.take())? {
             TuiOutcome::Quit => return Ok(0),
             TuiOutcome::Resume(session) => match execute_session(&registry, &session, false) {
-                Ok(execution) if execution.exit_code == 0 => return Ok(0),
+                Ok(execution) if execution.exit_code == 0 => {
+                    if open_in_app && let Err(error) = open_session_in_app(&registry, &session) {
+                        eprintln!("警告: Codex 会话已恢复，但无法打开 App: {error:#}");
+                    }
+                    return Ok(0);
+                }
                 Ok(execution) => {
                     let message =
                         format!("恢复失败: {} 退出码 {}", session.id, execution.exit_code);
@@ -77,12 +83,15 @@ fn resume_failure_requests_quit(answer: &str) -> bool {
 
 /// 执行已解析命令；显式 writer 便于测试且确保输出编码为 UTF-8 字节。
 pub fn run_cli(cli: Cli, mut stdout: impl Write, mut stderr: impl Write) -> Result<i32> {
+    let open_in_app = cli.open_in_app;
     match cli.command {
         Some(AgentmuxCommand::List(args)) => {
             run_list(args, &mut stdout, &mut stderr)?;
             Ok(0)
         }
-        Some(AgentmuxCommand::Resume(args)) => run_resume(args, &mut stdout, &mut stderr),
+        Some(AgentmuxCommand::Resume(args)) => {
+            run_resume(args, open_in_app, &mut stdout, &mut stderr)
+        }
         Some(AgentmuxCommand::Doctor(args)) => run_doctor(args.json, &mut stdout),
         Some(AgentmuxCommand::Sources(args)) => run_sources(args.json, &mut stdout),
         Some(AgentmuxCommand::Completion { shell }) => {
@@ -141,7 +150,12 @@ fn run_list(args: ListArgs, stdout: &mut impl Write, stderr: &mut impl Write) ->
 }
 
 /// 执行显式 resume 子命令，并把 Codex 退出码原样返回给 main。
-fn run_resume(args: ResumeArgs, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
+fn run_resume(
+    args: ResumeArgs,
+    open_in_app: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<i32> {
     let registry = default_registry()?;
     let catalog = SessionCatalog::from_report(registry.scan_all());
     let session = catalog
@@ -165,12 +179,17 @@ fn run_resume(args: ResumeArgs, stdout: &mut impl Write, stderr: &mut impl Write
     let execution = execute_session(&registry, &session, args.dry_run)?;
     if args.dry_run {
         writeln!(stdout, "将执行: {}", execution.command)?;
+        if open_in_app && let Some(uri) = prepare_app_uri(&registry, &session)? {
+            writeln!(stdout, "恢复成功后将打开: {uri}")?;
+        }
     } else if execution.exit_code != 0 {
         writeln!(
             stderr,
             "恢复命令失败，会话 {}，退出码 {}",
             session.id, execution.exit_code
         )?;
+    } else if open_in_app && let Err(error) = open_session_in_app(&registry, &session) {
+        writeln!(stderr, "警告: Codex 会话已恢复，但无法打开 App: {error:#}")?;
     }
     Ok(execution.exit_code)
 }
@@ -229,13 +248,30 @@ fn prepare_resume_command(registry: &ProviderRegistry, session: &Session) -> Res
     Ok(provider.build_resume_command(session)?)
 }
 
+/// 通过会话来源构造可选桌面应用 URI，来源不支持时返回空值。
+fn prepare_app_uri(registry: &ProviderRegistry, session: &Session) -> Result<Option<String>> {
+    let provider = registry
+        .get(&session.source)
+        .with_context(|| format!("来源 {} 未注册", session.source))?;
+    Ok(provider.build_app_uri(session)?)
+}
+
+/// 构造并打开来源桌面应用中的会话页面。
+fn open_session_in_app(registry: &ProviderRegistry, session: &Session) -> Result<()> {
+    let Some(uri) = prepare_app_uri(registry, session)? else {
+        return Ok(());
+    };
+    app_navigation::open_uri(&uri).context("调用系统 App URL 协议失败")
+}
+
 /// 汇总全部来源诊断并在存在 error 项时返回非零状态。
 fn run_doctor(json: bool, stdout: &mut impl Write) -> Result<i32> {
     let registry = default_registry()?;
-    let diagnostics = registry
+    let mut diagnostics = registry
         .providers()
         .flat_map(|provider| provider.diagnose())
         .collect::<Vec<_>>();
+    diagnostics.push(app_navigation::diagnostic());
     let has_error = diagnostics
         .iter()
         .any(|item| item.severity == DiagnosticSeverity::Error);

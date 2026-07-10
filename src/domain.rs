@@ -257,6 +257,8 @@ pub enum ProviderCapability {
     Diagnose,
     /// 支持模型提供商兼容别名修复。
     RepairProvider,
+    /// 支持构造桌面应用中的会话导航 URI。
+    OpenInApp,
 }
 
 /// 提供一个 Agent 来源的稳定标识和能力说明。
